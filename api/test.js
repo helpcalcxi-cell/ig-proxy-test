@@ -365,6 +365,89 @@ async function tierMobile(ctx, shortcode, jar, dispatcher, withSession) {
   };
 }
 
+// ---------------------------------------------------------------- TIER: reel page
+//
+// Ye Aayush ki khoj hai, meri nahi.
+//
+// Unhone incognito me (bina login ke) reel kholi aur DevTools me `video_versions`
+// search kiya. Vo seedha `/reel/{shortcode}/` ke HTML ke andar mila:
+//
+//   "video_versions":[{"type":101,"url":"https:\/\/instagram.fktu3-1.fna.fbcdn.net\/..."
+//
+// Pehle `.mp4` search kiya tha, vo match nahi hua — kyunki JSON me har slash
+// escape hota hai (`https:\/\/`). Isi wajah se ye cheez ab tak chhupi rahi.
+//
+// Hamare baaki chaaron tier API endpoints par jaate hain. Page KABHI fetch
+// nahi kiya tha. Ab sawaal ek hi hai: Instagram ye page hamare SERVER ko bhi
+// deta hai, ya sirf asli browser ko?
+//
+// Isliye yahan headers ek asli browser NAVIGATION jaise hain — `sec-fetch-mode:
+// navigate`, `sec-fetch-dest: document`, `Upgrade-Insecure-Requests`. Baaki
+// tier XHR jaise headers bhejte hain, jo bilkul alag dikhte hain.
+
+async function tierReelPage(ctx, shortcode, jar, dispatcher, withSession) {
+  const { res, text: html } = await grab(ctx, 'reel-page', `https://www.instagram.com/reel/${shortcode}/`, {
+    headers: {
+      'User-Agent': UA_WEB,
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Upgrade-Insecure-Requests': '1',
+      'sec-ch-ua': '"Chromium";v="131", "Not_A Brand";v="24"',
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"Windows"',
+      'sec-fetch-dest': 'document',
+      'sec-fetch-mode': 'navigate',
+      'sec-fetch-site': 'none',
+      'sec-fetch-user': '?1',
+      Cookie: cookieHeader(jar, withSession),
+    },
+    redirect: 'follow',
+  }, dispatcher);
+
+  if (!res.ok) return { ok: false, status: res.status, reason: `reel-page HTTP ${res.status}`, htmlLength: html.length };
+
+  // "video_versions":[{"type":101,"url":"https:\/\/..."  — pehla url uthao
+  let video = null;
+  const vv = html.match(/"video_versions"\s*:\s*\[(.*?)\]/s);
+  if (vv) video = (vv[1].match(/"url"\s*:\s*"(.*?)"/) || [])[1] || null;
+  if (!video) video = (html.match(/"video_url"\s*:\s*"(.*?)"/) || [])[1] || null;
+  if (!video) video = (html.match(/"playable_url(?:_quality_hd)?"\s*:\s*"(.*?)"/) || [])[1] || null;
+
+  const image =
+    (html.match(/"display_url"\s*:\s*"(.*?)"/) || [])[1] ||
+    (html.match(/property="og:image"\s+content="(.*?)"/) || [])[1] || null;
+
+  const username = (html.match(/"owner"\s*:\s*\{[^}]*?"username"\s*:\s*"(.*?)"/) || html.match(/"username"\s*:\s*"(.*?)"/) || [])[1] || null;
+
+  if (!video && !image) {
+    // Kya hume wahi khaali app shell mila jo pehle milta tha? Ye janna zaroori
+    // hai — "media nahi mila" aur "Instagram ne data diya hi nahi" do alag baatein.
+    const cdn = [...html.matchAll(/https:\\?\/\\?\/[^"'\s]*?(?:cdninstagram\.com|fbcdn\.net)[^"'\s]*/g)]
+      .slice(0, 2).map((x) => clean(x[0]).slice(0, 100));
+    return {
+      ok: false,
+      status: res.status,
+      reason: 'reel page me media nahi mila',
+      htmlLength: html.length,
+      hasVideoVersions: html.includes('video_versions'),
+      mediaCdnLinks: cdn,
+      isAppShell: html.length > 300000,
+    };
+  }
+
+  return {
+    ok: true,
+    status: res.status,
+    found: {
+      username,
+      is_video: Boolean(video),
+      items: 1,
+      htmlLength: html.length,
+      firstUrl: clean(video || image).slice(0, 90) + '…',
+    },
+  };
+}
+
 async function tierEmbed(ctx, shortcode, jar, dispatcher, withSession) {
   const { res, text: html } = await grab(ctx, 'embed', `https://www.instagram.com/p/${shortcode}/embed/captioned/`, {
     headers: {
@@ -540,11 +623,13 @@ export default async function handler(req, res) {
   }
 
   // --- 2. Chaaron tier
+  // reel-page sabse pehle: yahi naya sawaal hai. Baaki tier waise hi rahe.
   const ALL = [
-    ['graphql', tierGraphql],
+    ['reel-page', tierReelPage],
+    ['web-api', tierWebApi],
     ['mobile-api', tierMobile],
     ['embed', tierEmbed],
-    ['web-api', tierWebApi],
+    ['graphql', tierGraphql],
   ];
   const TIERS = onlyTier ? ALL.filter(([n]) => n === onlyTier) : ALL;
 
@@ -605,7 +690,7 @@ export default async function handler(req, res) {
       // Ye line sirf isliye hai taki ek nazar me pata chale ki GitHub par nayi
       // file chadhi ya nahi. Pichli baar teen test isliye bekaar gaye kyunki
       // purana code hi deploy tha aur bahar se ye dikhta hi nahi tha.
-      code_version: 'v2-session',
+      code_version: 'v3-reelpage',
       shortcode,
       proxy_used: useProxy,
       country_asked: country || '(koi bhi)',
