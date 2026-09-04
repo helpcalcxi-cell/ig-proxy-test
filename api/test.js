@@ -20,6 +20,7 @@
 // ============================================================
 
 import { ProxyAgent, Agent } from 'undici';
+import { gzipSync } from 'node:zlib';
 
 export const maxDuration = 30;
 
@@ -34,6 +35,10 @@ const UA_WEB =
 const UA_MOBILE =
   'Instagram 302.0.0.23.114 Android (33/13; 420dpi; 1080x2400; ' +
   'samsung; SM-G991B; o1s; exynos2100; en_US; 526face9)';
+
+// ⚠️ Ye tabhi use hoti hai jab URL me &session=1 ho. Default me test poori tarah
+//    anonymous rehta hai — yahi shuru se is file ka usool tha.
+const SESSIONID = process.env.IG_SESSIONID || '';
 
 const PROXY_HOST = process.env.PROXY_HOST || 'gw.dataimpulse.com';
 const PROXY_PORT = process.env.PROXY_PORT || '823';
@@ -83,11 +88,28 @@ function buildDispatcher(country, sess) {
 // Aise me wire null rahega — aur hum poori imaandari se bolenge ki wo request
 // naapi nahi ja saki, guess nahi karenge.
 
-function meter(ctx, label, res, bodyBytes) {
+function meter(ctx, label, res, text) {
+  const decoded = Buffer.byteLength(text);
+
   const cl = res.headers.get('content-length');
   const wire = cl && /^\d+$/.test(cl) ? Number(cl) : null;
-  ctx.calls.push({ call: label, status: res.status, wire, decoded: bodyBytes });
-  return wire;
+
+  // Jab content-length nahi aata (chunked response), tab hum khud gzip karke
+  // dekh lete hain ki compress hone par kitna banta. Instagram bhi gzip hi
+  // bhejta hai, isliye ye asli bill ke bahut kareeb hota hai.
+  //
+  // Pichli baar meri galti yahi thi: content-length na milne par maine un
+  // requests ko hisaab se hi baahar kar diya tha, aur 600 byte ke aadhar par
+  // "88 lakh lookups" chhaap diya jabki asli data 1.6 MB tha.
+  let est = wire;
+  let how = wire === null ? null : 'header';
+  if (wire === null) {
+    try { est = gzipSync(Buffer.from(text)).length; how = 'gzip-anumaan'; }
+    catch { est = null; }
+  }
+
+  ctx.calls.push({ call: label, status: res.status, wire, gzip_est: est, how, decoded });
+  return est;
 }
 
 async function grab(ctx, label, url, opts, dispatcher) {
@@ -97,7 +119,7 @@ async function grab(ctx, label, url, opts, dispatcher) {
     signal: AbortSignal.timeout(10000),
   });
   const text = await res.text();
-  meter(ctx, label, res, Buffer.byteLength(text));
+  meter(ctx, label, res, text);
   return { res, text };
 }
 
@@ -145,12 +167,24 @@ function igMessageFrom(text) {
   }
 }
 
-function cookieHeader(jar) {
-  // ⚠️ Yahan sessionid JAAN BUJH KAR nahi hai. Test anonymous hi rehna chahiye.
-  return Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ');
+/** sessionid ke andar hi user id chhupi hoti hai: "12345678%3AabcXYZ%3A12..." */
+function dsUserIdFromSession(sid) {
+  if (!sid) return null;
+  const first = decodeURIComponent(String(sid)).split(':')[0];
+  return /^\d+$/.test(first) ? first : null;
 }
 
-function webHeaders(jar, extra = {}) {
+function cookieHeader(jar, withSession) {
+  const all = { ...jar };
+  if (withSession && SESSIONID) {
+    all.sessionid = SESSIONID;
+    const ds = dsUserIdFromSession(SESSIONID);
+    if (ds) all.ds_user_id = ds;
+  }
+  return Object.entries(all).map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+function webHeaders(jar, withSession, extra = {}) {
   return {
     'User-Agent': UA_WEB,
     'Accept-Language': 'en-US,en;q=0.9',
@@ -163,7 +197,7 @@ function webHeaders(jar, extra = {}) {
     'sec-fetch-site': 'same-origin',
     'sec-fetch-mode': 'cors',
     'sec-fetch-dest': 'empty',
-    Cookie: cookieHeader(jar),
+    Cookie: cookieHeader(jar, withSession),
     ...extra,
   };
 }
@@ -217,7 +251,7 @@ async function getGuestCookies(ctx, dispatcher) {
   }
 
   const html = await res.text();
-  meter(ctx, 'cookie-bootstrap', res, Buffer.byteLength(html));
+  meter(ctx, 'cookie-bootstrap', res, html);
 
   if (!jar.csrftoken) {
     const m = html.match(/"csrf_token":"([^"]+)"/);
@@ -229,7 +263,7 @@ async function getGuestCookies(ctx, dispatcher) {
 
 // ---------------------------------------------------------------- tiers
 
-async function tierGraphql(ctx, shortcode, jar, dispatcher) {
+async function tierGraphql(ctx, shortcode, jar, dispatcher, withSession) {
   const body = new URLSearchParams({
     variables: JSON.stringify({
       shortcode,
@@ -243,7 +277,7 @@ async function tierGraphql(ctx, shortcode, jar, dispatcher) {
 
   const { res, text } = await grab(ctx, 'graphql', 'https://www.instagram.com/graphql/query/', {
     method: 'POST',
-    headers: webHeaders(jar, {
+    headers: webHeaders(jar, withSession, {
       'content-type': 'application/x-www-form-urlencoded',
       Accept: '*/*',
       Origin: 'https://www.instagram.com',
@@ -281,21 +315,27 @@ async function tierGraphql(ctx, shortcode, jar, dispatcher) {
   };
 }
 
-async function tierMobile(ctx, shortcode, jar, dispatcher) {
+async function tierMobile(ctx, shortcode, jar, dispatcher, withSession) {
   const mediaId = shortcodeToMediaId(shortcode);
 
-  // ⚠️ Yahan koi Cookie header nahi ja raha. Mobile endpoint ko poori tarah
-  //    anonymous hit karna hi is test ka asli imtihaan hai.
-  const { res, text } = await grab(ctx, 'mobile-api', `https://i.instagram.com/api/v1/media/${mediaId}/info/`, {
-    headers: {
-      'User-Agent': UA_MOBILE,
-      'X-IG-App-ID': IG_APP_ID,
-      'X-IG-Capabilities': '3brTvw==',
-      'X-IG-Connection-Type': 'WIFI',
-      'Accept-Language': 'en-US',
-      Accept: '*/*',
-    },
-  }, dispatcher);
+  // Default me yahan koi Cookie header nahi jaata — anonymous test ka usool.
+  // &session=1 par hi sessionid lagti hai, aur tab ye poori tarah alag sawaal
+  // ban jaata hai: "kya residential IP par ye account zinda rehta hai?"
+  const headers = {
+    'User-Agent': UA_MOBILE,
+    'X-IG-App-ID': IG_APP_ID,
+    'X-IG-Capabilities': '3brTvw==',
+    'X-IG-Connection-Type': 'WIFI',
+    'Accept-Language': 'en-US',
+    Accept: '*/*',
+  };
+  if (withSession && SESSIONID) {
+    const ds = dsUserIdFromSession(SESSIONID);
+    headers.Cookie = `sessionid=${SESSIONID}` + (ds ? `; ds_user_id=${ds}` : '');
+    if (ds) headers['X-IG-Android-ID'] = `android-${ds.slice(0, 16)}`;
+  }
+
+  const { res, text } = await grab(ctx, 'mobile-api', `https://i.instagram.com/api/v1/media/${mediaId}/info/`, { headers }, dispatcher);
 
   if (looksLikeHtml(text))
     return { ok: false, status: res.status, reason: 'mobile api ne HTML bheja' };
@@ -325,14 +365,14 @@ async function tierMobile(ctx, shortcode, jar, dispatcher) {
   };
 }
 
-async function tierEmbed(ctx, shortcode, jar, dispatcher) {
+async function tierEmbed(ctx, shortcode, jar, dispatcher, withSession) {
   const { res, text: html } = await grab(ctx, 'embed', `https://www.instagram.com/p/${shortcode}/embed/captioned/`, {
     headers: {
       'User-Agent': UA_WEB,
       'Accept-Language': 'en-US,en;q=0.9',
       Accept: 'text/html,application/xhtml+xml,*/*;q=0.8',
       Referer: 'https://www.instagram.com/',
-      Cookie: cookieHeader(jar),
+      Cookie: cookieHeader(jar, withSession),
     },
   }, dispatcher);
 
@@ -361,14 +401,25 @@ async function tierEmbed(ctx, shortcode, jar, dispatcher) {
   };
 }
 
-async function tierWebApi(ctx, shortcode, jar, dispatcher) {
+async function tierWebApi(ctx, shortcode, jar, dispatcher, withSession) {
   const mediaId = shortcodeToMediaId(shortcode);
 
   const { res, text } = await grab(ctx, 'web-api', `https://www.instagram.com/api/v1/media/${mediaId}/info/`, {
-    headers: webHeaders(jar, { Accept: '*/*', Referer: `https://www.instagram.com/p/${shortcode}/` }),
+    headers: webHeaders(jar, withSession, { Accept: '*/*', Referer: `https://www.instagram.com/p/${shortcode}/` }),
   }, dispatcher);
 
-  if (looksLikeHtml(text)) return { ok: false, status: res.status, reason: 'web api ne HTML bheja' };
+  // JSON ki jagah HTML aaya matlab Instagram ne data nahi, apna web page bhej
+  // diya. Agar wo page bahut bada hai to wo poora logged-out app shell hai.
+  // Ye flag zaroori hai — iske bina akele chalne par verdict UNKNOWN aa jata
+  // tha, jabki asli wajah saaf thi.
+  if (looksLikeHtml(text))
+    return {
+      ok: false,
+      status: res.status,
+      reason: 'web api ne HTML bheja',
+      htmlLength: text.length,
+      isAppShell: text.length > 300000,
+    };
   if (!res.ok) return { ok: false, status: res.status, reason: `web api HTTP ${res.status}`, igMessage: igMessageFrom(text), sample: text.slice(0, 250) };
 
   let json;
@@ -388,14 +439,19 @@ async function tierWebApi(ctx, shortcode, jar, dispatcher) {
 
 // ---------------------------------------------------------------- verdict
 
-function verdictOf(attempts, proxyOk) {
+function verdictOf(attempts, proxyOk, withSession) {
   const blob = JSON.stringify(attempts);
 
   if (attempts.some((a) => a.ok)) {
-    return {
-      code: 'ANONYMOUS_WORKS',
-      hindi: 'Chal gaya. Residential IP se Instagram ne bina kisi account ke data de diya. Aapko Instagram account chahiye hi nahi.',
-    };
+    return withSession
+      ? {
+          code: 'SESSION_WORKS_ON_PROXY',
+          hindi: 'Chal gaya — residential IP par aapki sessionid accept ho gayi. Ab dekhna ye hai ki kitne din tikti hai; agar Vercel ke IP se zyada tiki, to yahi rasta hai.',
+        }
+      : {
+          code: 'ANONYMOUS_WORKS',
+          hindi: 'Chal gaya. Residential IP se Instagram ne bina kisi account ke data de diya. Aapko Instagram account chahiye hi nahi.',
+        };
   }
   if (!proxyOk) {
     return {
@@ -405,6 +461,18 @@ function verdictOf(attempts, proxyOk) {
   }
   if (/challenge_required|checkpoint_required/i.test(blob)) {
     return { code: 'CHALLENGE', hindi: 'Instagram ne is IP par verification maang li.' };
+  }
+  if (withSession && /logout_reason|You.{0,3}ve Been Logged Out/i.test(blob)) {
+    return {
+      code: 'SESSION_DEAD',
+      hindi: 'sessionid khud mar chuki hai — ye proxy ki galti nahi hai. Naya sessionid banao, phir dobara test karo.',
+    };
+  }
+  if (withSession && /login_required|require_login/i.test(blob)) {
+    return {
+      code: 'SESSION_REJECTED',
+      hindi: 'sessionid accept nahi hui. Ya to galat copy hui, ya expire ho chuki hai, ya Instagram ko IP badalna khatak gaya (account Vercel ke IP par bana tha, ab India/US ke ghar se aa raha hai).',
+    };
   }
   if (/login_required|require_login/i.test(blob)) {
     return {
@@ -445,6 +513,11 @@ export default async function handler(req, res) {
   const country = (req.query.country || '').toLowerCase().replace(/[^a-z]/g, '');
   const useProxy = req.query.noproxy !== '1';
   const onlyTier = (req.query.tier || '').toLowerCase();
+
+  // &session=1 tabhi kuch karta hai jab IG_SESSIONID env var bhi set ho.
+  // Dono me se ek bhi na ho to test anonymous hi rahega — chupke se session
+  // lag jana sabse bura hota, kyunki natija sach lagta par hota jhoot.
+  const withSession = req.query.session === '1' && Boolean(SESSIONID);
 
   const sess = Math.random().toString(36).slice(2, 10);
   const ctx = { calls: [] };
@@ -487,7 +560,7 @@ export default async function handler(req, res) {
       continue;
     }
     try {
-      const r = await fn(ctx, shortcode, jar, dispatcher);
+      const r = await fn(ctx, shortcode, jar, dispatcher, withSession);
       attempts.push({ tier: name, ...r });
       if (r.ok) break; // mil gaya to aage ka data kharch mat karo
     } catch (e) {
@@ -496,36 +569,48 @@ export default async function handler(req, res) {
   }
 
   // --- 3. Kitna data laga
-  const measured = ctx.calls.filter((c) => c.wire !== null);
-  const wireTotal = measured.reduce((s, c) => s + c.wire, 0);
+  //
+  // Ab har request ka hisaab hai: ya header se, ya khud gzip karke. Koi request
+  // hisaab se bahar nahi chhodi jaati — pichli baar wahi galti hui thi.
+  const billable = ctx.calls.reduce((s, c) => s + (c.gzip_est || 0), 0);
   const decodedTotal = ctx.calls.reduce((s, c) => s + c.decoded, 0);
-  const unmeasured = ctx.calls.length - measured.length;
+  const guessed = ctx.calls.filter((c) => c.how === 'gzip-anumaan').length;
+  const missed = ctx.calls.filter((c) => c.gzip_est === null).length;
 
   const kb = (n) => Math.round(n / 102.4) / 10;
 
-  // 5 GB = 5368709120 bytes. Sirf tab batao jab kuch naapa gaya ho.
-  const perLookup = wireTotal || null;
-  const budget = perLookup
+  const budget = billable
     ? {
-        note: unmeasured
-          ? `${unmeasured} request ka content-length nahi mila, wo is hisaab me nahi hai — asli kharcha isse thoda zyada hoga.`
-          : 'Saari requests naapi gayin.',
-        lookups_in_5GB: Math.floor(5368709120 / perLookup),
-        lookups_in_50GB: Math.floor(53687091200 / perLookup),
+        per_lookup_kb: kb(billable),
+        note:
+          (guessed ? `${guessed} request khud gzip karke naapi gayi (header nahi tha). ` : '') +
+          (missed ? `${missed} request naapi hi nahi ja saki. ` : '') +
+          'Ye asli bill ke kareeb hai, par bilkul barabar nahi — proxy TLS aur header ka kuch overhead bhi ginta hai.',
+        lookups_in_5GB: Math.floor(5368709120 / billable),
+        lookups_in_50GB: Math.floor(53687091200 / billable),
+        // Asli site par har lookup itna mehnga nahi padega: jo tier pehle chal
+        // jayega uske baad ke tier chalte hi nahi, aur CDN cache to bahut si
+        // requests ko Instagram tak pahunchne hi nahi deta.
+        dhyan_do: 'Ye ek POORE test ka kharcha hai (saare tier). Live site par jo tier chal jata hai wahin ruk jaata hai, aur cache hit par to kuch bhi kharch nahi hota.',
       }
-    : { note: 'Kuch bhi naapa nahi ja saka — content-length header nahi aaya.' };
+    : { note: 'Kuch bhi naapa nahi ja saka.' };
 
-  const verdict = verdictOf(attempts, proxyOk);
+  const verdict = verdictOf(attempts, proxyOk, withSession);
 
   return res.status(200).json({
     verdict: verdict.code,
     matlab: verdict.hindi,
 
     setup: {
+      // Ye line sirf isliye hai taki ek nazar me pata chale ki GitHub par nayi
+      // file chadhi ya nahi. Pichli baar teen test isliye bekaar gaye kyunki
+      // purana code hi deploy tha aur bahar se ye dikhta hi nahi tha.
+      code_version: 'v2-session',
       shortcode,
       proxy_used: useProxy,
       country_asked: country || '(koi bhi)',
-      session_id_used: false, // ye hamesha false hai — yahi test ka point hai
+      session_id_used: withSession,
+      session_available: Boolean(SESSIONID),
       doc_id: DOC_ID,
       took_ms: Date.now() - t0,
     },
@@ -539,11 +624,10 @@ export default async function handler(req, res) {
 
     data_used: {
       requests: ctx.calls.length,
-      wire_bytes: wireTotal,
-      decoded_bytes: decodedTotal,
-      wire_kb: kb(wireTotal),
+      billable_bytes: billable,
+      billable_kb: kb(billable),
       decoded_kb: kb(decodedTotal),
-      per_call: ctx.calls.map((c) => ({ ...c, wire_kb: c.wire === null ? null : kb(c.wire), decoded_kb: kb(c.decoded) })),
+      per_call: ctx.calls.map((c) => ({ ...c, billable_kb: c.gzip_est === null ? null : kb(c.gzip_est), decoded_kb: kb(c.decoded) })),
       budget,
     },
 
