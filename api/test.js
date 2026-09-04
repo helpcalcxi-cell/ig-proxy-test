@@ -367,23 +367,70 @@ async function tierMobile(ctx, shortcode, jar, dispatcher, withSession) {
 
 // ---------------------------------------------------------------- TIER: reel page
 //
-// Ye Aayush ki khoj hai, meri nahi.
+// Ye Aayush ki khoj hai. Unhone incognito me (bina login ke) reel kholi aur
+// DevTools me `video_versions` search kiya — vo seedha `/reel/{shortcode}/` ke
+// HTML me mila. Hamare baaki tier API endpoints par jaate hain; page kabhi
+// fetch hi nahi kiya tha.
 //
-// Unhone incognito me (bina login ke) reel kholi aur DevTools me `video_versions`
-// search kiya. Vo seedha `/reel/{shortcode}/` ke HTML ke andar mila:
+// ⚠️ v3 me is tier ne JHOOTH bola tha. `og:image` wale fallback ne Instagram ka
+//    apna UI logo (static.cdninstagram.com/rsrc.php/...png) utha liya aur
+//    `ok: true` bol diya, jabki page bilkul khaali tha. Isliye ab:
 //
-//   "video_versions":[{"type":101,"url":"https:\/\/instagram.fktu3-1.fna.fbcdn.net\/..."
-//
-// Pehle `.mp4` search kiya tha, vo match nahi hua — kyunki JSON me har slash
-// escape hota hai (`https:\/\/`). Isi wajah se ye cheez ab tak chhupi rahi.
-//
-// Hamare baaki chaaron tier API endpoints par jaate hain. Page KABHI fetch
-// nahi kiya tha. Ab sawaal ek hi hai: Instagram ye page hamare SERVER ko bhi
-// deta hai, ya sirf asli browser ko?
-//
-// Isliye yahan headers ek asli browser NAVIGATION jaise hain — `sec-fetch-mode:
-// navigate`, `sec-fetch-dest: document`, `Upgrade-Insecure-Requests`. Baaki
-// tier XHR jaise headers bhejte hain, jo bilkul alag dikhte hain.
+//    1. Media URL ki HOST check hoti hai — static.cdninstagram.com aur
+//       /rsrc.php/ hamesha reject. Wahan sirf UI ke icons hote hain.
+//    2. Pehle page ke andar ka JSON parse hota hai, regex baad me. JSON se
+//       carousel ke saare slide bhi mil jaate hain, jo regex se nahi milte.
+//    3. ok: true tabhi jab kam se kam EK asli media URL mile. Warna nahi.
+
+const STATIC_ASSET = /static\.cdninstagram\.com|\/rsrc\.php\//i;
+
+/** Kya ye sach me media hai, ya Instagram ke UI ka koi icon? */
+function isRealMedia(u) {
+  if (typeof u !== 'string' || !u) return false;
+  if (!/(?:cdninstagram\.com|fbcdn\.net)/i.test(u)) return false;
+  return !STATIC_ASSET.test(u);
+}
+
+/** Page ke andar <script type="application/json"> blocks */
+function jsonBlobs(html) {
+  const out = [];
+  for (const m of html.matchAll(/<script[^>]*type="application\/json"[^>]*>([\s\S]*?)<\/script>/gi)) {
+    try { out.push(JSON.parse(m[1])); } catch { /* har blob JSON nahi hota */ }
+  }
+  return out;
+}
+
+/**
+ * Gehraai me ja kar wo object dhoondhta hai jo ek media item lagta hai.
+ * Instagram ka JSON bahut ghont kar rakha hota hai, isliye seedha rasta nahi hai.
+ * `code` milne wala item sabse behtar; na mile to koi bhi media item.
+ */
+function findMediaItem(node, shortcode, depth = 0, best = { exact: null, any: null }) {
+  if (!node || typeof node !== 'object' || depth > 40) return best;
+
+  if (Array.isArray(node)) {
+    for (const x of node) findMediaItem(x, shortcode, depth + 1, best);
+    return best;
+  }
+
+  const isItem = Boolean(node.video_versions || node.carousel_media || node.image_versions2);
+  if (isItem) {
+    if (node.code === shortcode && !best.exact) best.exact = node;
+    else if (!best.any) best.any = node;
+  }
+
+  for (const k of Object.keys(node)) findMediaItem(node[k], shortcode, depth + 1, best);
+  return best;
+}
+
+/** Ek node me se sabse achhi media URL — video ho to video, warna sabse badi photo */
+function mediaOf(node) {
+  const v = node.video_versions?.find((x) => isRealMedia(x?.url))?.url;
+  if (v) return { type: 'video', url: clean(v) };
+  const cands = (node.image_versions2?.candidates || []).filter((c) => isRealMedia(c?.url));
+  const best = [...cands].sort((a, b) => (b.width || 0) - (a.width || 0))[0];
+  return best ? { type: 'image', url: clean(best.url) } : null;
+}
 
 async function tierReelPage(ctx, shortcode, jar, dispatcher, withSession) {
   const { res, text: html } = await grab(ctx, 'reel-page', `https://www.instagram.com/reel/${shortcode}/`, {
@@ -404,47 +451,89 @@ async function tierReelPage(ctx, shortcode, jar, dispatcher, withSession) {
     redirect: 'follow',
   }, dispatcher);
 
-  if (!res.ok) return { ok: false, status: res.status, reason: `reel-page HTTP ${res.status}`, htmlLength: html.length };
+  // Ye teen number hamesha bahar jaate hain — inhi se pata chalta hai ki page
+  // asli tha ya khaali. Pichli baar yahi na hone ki wajah se galti pakdi nahi gayi.
+  const facts = {
+    htmlLength: html.length,
+    hasVideoVersions: html.includes('video_versions'),
+    hasCarousel: html.includes('carousel_media'),
+  };
 
-  // "video_versions":[{"type":101,"url":"https:\/\/..."  — pehla url uthao
+  if (!res.ok) return { ok: false, status: res.status, reason: `reel-page HTTP ${res.status}`, ...facts };
+
+  // --- 1. JSON rasta (behtar — carousel ke saare slide isi se milte hain)
+  let item = null;
+  for (const blob of jsonBlobs(html)) {
+    const found = findMediaItem(blob, shortcode);
+    item = found.exact || found.any;
+    if (item) break;
+  }
+
+  if (item) {
+    const nodes = item.carousel_media?.length ? item.carousel_media : [item];
+    const media = nodes.map(mediaOf).filter(Boolean);
+    if (media.length) {
+      return {
+        ok: true,
+        status: res.status,
+        via: 'json',
+        found: {
+          username: item.user?.username || item.owner?.username || null,
+          is_video: media.some((m) => m.type === 'video'),
+          items: media.length,
+          types: media.map((m) => m.type),
+          caption: (item.caption?.text || '').slice(0, 60) || null,
+          ...facts,
+          firstUrl: media[0].url.slice(0, 90) + '…',
+        },
+      };
+    }
+  }
+
+  // --- 2. Regex rasta (JSON na mile to) — par host check ke saath
   let video = null;
   const vv = html.match(/"video_versions"\s*:\s*\[(.*?)\]/s);
   if (vv) video = (vv[1].match(/"url"\s*:\s*"(.*?)"/) || [])[1] || null;
   if (!video) video = (html.match(/"video_url"\s*:\s*"(.*?)"/) || [])[1] || null;
   if (!video) video = (html.match(/"playable_url(?:_quality_hd)?"\s*:\s*"(.*?)"/) || [])[1] || null;
+  video = video && isRealMedia(clean(video)) ? clean(video) : null;
 
-  const image =
-    (html.match(/"display_url"\s*:\s*"(.*?)"/) || [])[1] ||
-    (html.match(/property="og:image"\s+content="(.*?)"/) || [])[1] || null;
+  let image = (html.match(/"display_url"\s*:\s*"(.*?)"/) || [])[1] || null;
+  image = image && isRealMedia(clean(image)) ? clean(image) : null;
 
-  const username = (html.match(/"owner"\s*:\s*\{[^}]*?"username"\s*:\s*"(.*?)"/) || html.match(/"username"\s*:\s*"(.*?)"/) || [])[1] || null;
-
-  if (!video && !image) {
-    // Kya hume wahi khaali app shell mila jo pehle milta tha? Ye janna zaroori
-    // hai — "media nahi mila" aur "Instagram ne data diya hi nahi" do alag baatein.
-    const cdn = [...html.matchAll(/https:\\?\/\\?\/[^"'\s]*?(?:cdninstagram\.com|fbcdn\.net)[^"'\s]*/g)]
-      .slice(0, 2).map((x) => clean(x[0]).slice(0, 100));
+  if (video || image) {
+    const username = (html.match(/"owner"\s*:\s*\{[^}]*?"username"\s*:\s*"(.*?)"/) || [])[1] || null;
     return {
-      ok: false,
+      ok: true,
       status: res.status,
-      reason: 'reel page me media nahi mila',
-      htmlLength: html.length,
-      hasVideoVersions: html.includes('video_versions'),
-      mediaCdnLinks: cdn,
-      isAppShell: html.length > 300000,
+      via: 'regex',
+      found: {
+        username,
+        is_video: Boolean(video),
+        items: 1,
+        types: [video ? 'video' : 'image'],
+        ...facts,
+        firstUrl: (video || image).slice(0, 90) + '…',
+      },
     };
   }
 
+  // --- 3. Kuch nahi mila. Ab saaf saaf batao ki kya nahi mila.
+  const cdn = [...html.matchAll(/https:\\?\/\\?\/[^"'\s]*?(?:cdninstagram\.com|fbcdn\.net)[^"'\s]*/g)]
+    .map((x) => clean(x[0]))
+    .filter(isRealMedia)
+    .slice(0, 2)
+    .map((u) => u.slice(0, 100));
+
   return {
-    ok: true,
+    ok: false,
     status: res.status,
-    found: {
-      username,
-      is_video: Boolean(video),
-      items: 1,
-      htmlLength: html.length,
-      firstUrl: clean(video || image).slice(0, 90) + '…',
-    },
+    reason: facts.hasVideoVersions
+      ? 'page me video_versions to hai par media nikal nahi paye — parsing sudharni hai'
+      : 'page khaali aaya (video_versions hai hi nahi) — Instagram ne data diya hi nahi',
+    ...facts,
+    realMediaLinks: cdn,
+    isAppShell: html.length > 300000 && !facts.hasVideoVersions,
   };
 }
 
@@ -690,7 +779,7 @@ export default async function handler(req, res) {
       // Ye line sirf isliye hai taki ek nazar me pata chale ki GitHub par nayi
       // file chadhi ya nahi. Pichli baar teen test isliye bekaar gaye kyunki
       // purana code hi deploy tha aur bahar se ye dikhta hi nahi tha.
-      code_version: 'v3-reelpage',
+      code_version: 'v4-strict',
       shortcode,
       proxy_used: useProxy,
       country_asked: country || '(koi bhi)',
